@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lab AWS-02 — Lambda + API Gateway
+  Crea una función Lambda básica expuesta públicamente
+  a través de un API Gateway REST.
+
+# ─────────────────────────────────────────
+# PARÁMETROS (variables de entrada)
+# ─────────────────────────────────────────
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: lab
+    Description: Prefijo para nombrar los recursos
+
+  UniqueSuffix:
+    Type: String
+    Description: >
+      Tu nombre o alias único (ej. juan-perez).
+      Evita colisiones con otros alumnos en la misma cuenta.
+
+# ─────────────────────────────────────────
+# RECURSOS (lo que CloudFormation va a crear)
+# ─────────────────────────────────────────
+Resources:
+
+  # ── 1. ROL IAM ──────────────────────────
+  # Lambda necesita permisos para escribir logs en CloudWatch.
+  # Este rol se los otorga.
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-lambda-role-${UniqueSuffix}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Política AWS predefinida: permisos básicos de Lambda (logs, etc.)
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ── 2. FUNCIÓN LAMBDA ────────────────────
+  # La función que se ejecutará. El código va inline en la plantilla
+  # (para producción usarías un bucket S3 o un ZIP).
+  HelloLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole   # ← Espera a que el rol exista primero
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-hello-${UniqueSuffix}"
+      Runtime: python3.12
+      Handler: index.handler           # Archivo "index", función "handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10                      # Segundos máximos de ejecución
+      MemorySize: 128                  # MB de memoria asignados
+      Code:
+        ZipFile: |
+          import json
+
+          def handler(event, context):
+              """
+              Punto de entrada de la Lambda.
+              'event' contiene la petición HTTP (método, path, body, etc.)
+              'context' contiene metadatos de la ejecución.
+              """
+              nombre = "Mundo"
+
+              # Si viene un query string ?nombre=Ana, lo usamos
+              if event.get("queryStringParameters"):
+                  nombre = event["queryStringParameters"].get("nombre", "Mundo")
+
+              return {
+                  "statusCode": 200,
+                  "headers": {"Content-Type": "application/json"},
+                  "body": json.dumps({
+                      "mensaje": f"¡Hola, {nombre}! 👋",
+                      "fuente": "Lambda + API Gateway con CloudFormation"
+                  }, ensure_ascii=False)
+              }
+
+  # ── 3. API GATEWAY (REST API) ────────────
+  # El "frontend" público que recibe peticiones HTTP
+  # y las redirige a la Lambda.
+  HelloRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${EnvironmentName}-api-${UniqueSuffix}"
+      Description: API pública que invoca la función Lambda
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # ── 4. RECURSO (PATH) ────────────────────
+  # Define el path /hello dentro del API.
+  # Los APIs Gateway trabajan con un árbol de recursos (paths).
+  HelloResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HelloRestApi
+      ParentId: !GetAtt HelloRestApi.RootResourceId  # Padre = raíz "/"
+      PathPart: hello                                 # Resultado: /hello
+
+  # ── 5. MÉTODO HTTP ───────────────────────
+  # Acepta peticiones GET en /hello y las envía a Lambda.
+  HelloGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HelloRestApi
+      ResourceId: !Ref HelloResource
+      HttpMethod: GET
+      AuthorizationType: NONE          # Endpoint público (sin auth)
+      Integration:
+        Type: AWS_PROXY                # Modo proxy: Lambda recibe el evento completo
+        IntegrationHttpMethod: POST    # API Gateway SIEMPRE usa POST para invocar Lambda
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations"
+          - LambdaArn: !GetAtt HelloLambdaFunction.Arn
+
+  # ── 6. PERMISO ───────────────────────────
+  # Autoriza a API Gateway a invocar (ejecutar) la Lambda.
+  # Sin esto, API Gateway recibiría un error 403 al llamar a Lambda.
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt HelloLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${HelloRestApi}/*/GET/hello"
+
+  # ── 7. DEPLOYMENT ────────────────────────
+  # "Publica" una versión del API. Sin deployment, el API no es accesible.
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: HelloGetMethod          # ← El método debe existir antes de publicar
+    Properties:
+      RestApiId: !Ref HelloRestApi
+
+  # ── 8. STAGE ─────────────────────────────
+  # Un stage es un ambiente del API (dev, staging, prod).
+  # Define la URL final: https://{id}.execute-api.{region}.amazonaws.com/{stage}/hello
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref HelloRestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref EnvironmentName  # Usamos el valor del parámetro (ej. "lab")
+
+# ─────────────────────────────────────────
+# OUTPUTS (valores que exporta el stack)
+# ─────────────────────────────────────────
+Outputs:
+
+  LambdaFunctionName:
+    Description: Nombre de la función Lambda creada
+    Value: !Ref HelloLambdaFunction
+
+  ApiEndpoint:
+    Description: URL pública del endpoint (pruébala en tu navegador)
+    Value: !Sub "https://${HelloRestApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/hello"
+
+  ApiEndpointConNombre:
+    Description: Ejemplo con query string personalizado
+    Value: !Sub "https://${HelloRestApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}/hello?nombre=TuNombre"
